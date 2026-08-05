@@ -1,0 +1,9 @@
+# NEVER commit API keys — this file holds live trading credentials
+api_key_config.json
+.env
+*.log
+*.out
+__pycache__/
+*.pyc
+.venv/
+venv/

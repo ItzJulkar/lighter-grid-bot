@@ -29,8 +29,9 @@ SL_BUFFER_PCT = 0.3          # SL = sr_distance% + this
 LIMIT_TTL_SEC = 5            # refresh resting limit if unfilled
 POLL_SEC = 2
 SWING_LOOKBACK = 12
-SWING_BARS = 40
+SWING_BARS = 100
 MIN_SR_DIST_PCT = 0.15
+ORDER_OFFSET_PCT = 0.05      # resting limit offset from mark (bid/ask edge)
 PAPER_MARGIN_USD = 100.0     # paper portfolio (user spec)
 LIVE_MODE = False            # TRUE = real orders (needs api_key_config.json)
 API_KEY_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_key_config.json")
@@ -214,19 +215,21 @@ class SRBot:
 
     def _manage_resting(self, mark, now, sr_dist, s, r):
         sz = self.size_for(mark)
+        buy_px = mark * (1 - ORDER_OFFSET_PCT / 100.0)
+        sell_px = mark * (1 + ORDER_OFFSET_PCT / 100.0)
         if self.buy_limit and now - self.buy_limit[2] > LIMIT_TTL_SEC:
-            log(f"  buy limit {self.buy_limit[1]:.2f} unfilled {LIMIT_TTL_SEC}s — replacing at {mark:.2f}")
+            log(f"  buy limit {self.buy_limit[1]:.2f} unfilled {LIMIT_TTL_SEC}s — replacing at {buy_px:.2f}")
             self.buy_limit = None
         if self.sell_limit and now - self.sell_limit[2] > LIMIT_TTL_SEC:
-            log(f"  sell limit {self.sell_limit[1]:.2f} unfilled {LIMIT_TTL_SEC}s — replacing at {mark:.2f}")
+            log(f"  sell limit {self.sell_limit[1]:.2f} unfilled {LIMIT_TTL_SEC}s — replacing at {sell_px:.2f}")
             self.sell_limit = None
         if self.buy_limit is None:
-            self.buy_limit = (self.order_seq, mark, now); self.order_seq += 1
-            log(f"  LIMIT BUY @ {mark:.2f} size={sz:.4f}")
+            self.buy_limit = (self.order_seq, buy_px, now); self.order_seq += 1
+            log(f"  LIMIT BUY @ {buy_px:.2f} size={sz:.4f}")
         if self.sell_limit is None:
-            self.sell_limit = (self.order_seq, mark, now); self.order_seq += 1
-            log(f"  LIMIT SELL @ {mark:.2f} size={sz:.4f}")
-        # fill simulation (paper) / assumption (live, verified next loop)
+            self.sell_limit = (self.order_seq, sell_px, now); self.order_seq += 1
+            log(f"  LIMIT SELL @ {sell_px:.2f} size={sz:.4f}")
+        # fill simulation: buy fills when mark dips to/under limit; sell when mark rises to/over
         if mark <= self.buy_limit[1]:
             self._open("long", self.buy_limit[1], sz, sr_dist, s, r)
         elif mark >= self.sell_limit[1]:

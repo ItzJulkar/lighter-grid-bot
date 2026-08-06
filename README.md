@@ -7,7 +7,7 @@ Two bots in this repo:
 | Bot | File | What it does |
 |-----|------|--------------|
 | **Grid Bot v1** | `grid_bot.py` | Classic geometric grid — buy levels below, sell levels above, counter-orders on fills |
-| **S/R Scalper v2** | `s_r_bot.py` | Support/Resistance scalper — 15x, 80% margin, limit entries at market (5s refresh), SL = S/R dist + 0.3%, TP at opposite S/R, market exits, pause outside S/R zone |
+| **S/R Scalper v3** | `s_r_bot.py` | Candle-based structure scalper — 5m/24h S/R zones, resting limits at zone edges (buy-dip at support / sell-rally at resistance), SL = zone dist + 0.3%, TP at opposite level, persistent ledger + state, agent_zone.json override |
 
 Both run in **paper mode by default** (real market prices, simulated fills, virtual margin). No keys needed to try them.
 
@@ -52,16 +52,21 @@ Windows: use `python s_r_bot.py`. No other OS-specific steps — pure Python + a
 > scalper uses 15x leverage / 80% margin — a 0.7% adverse move ≈ 8% of margin
 > per trade. Trading perps can liquidate your position. Use at your own risk.
 
-## How the S/R scalper works (v2 spec)
+## How the S/R scalper works (v3 spec)
 
-- **15x leverage, 80% margin** per position
-- **Entry:** always LIMIT at market price; if unfilled after 5s → cancel & re-place at the new market price
-- **Close:** always MARKET
-- **Stop-loss:** S/R distance + 0.3% buffer (e.g. resistance 1900 with support 0.4% lower → SL 0.7%)
-- **Take-profit:** opposite S/R level
-- **Both sides:** a resting buy limit + a resting sell limit (long & short)
-- **Pause/resume:** price outside the S/R zone → no new orders (open position stays SL-managed); when 2 supports + 2 resistances re-form → resume trading
-- S/R detection: swing highs/lows from the live mark-price series
+- **15x leverage, 80% margin** per position, $100 paper portfolio
+- **Structure:** 5m candles from the Lighter candles API (24h lookback / 288 bars), swing pivots on candle highs/lows, pivot levels clustered and merged into zones
+- **Zone trading (3 modes):**
+  - price inside a zone → resting buy at support **and** resting sell at resistance
+  - price below a zone → "buy the dip" limit at the zone support (reclaim play)
+  - price above a zone → "sell the rally" limit at the zone resistance
+- **Entry:** always LIMIT at the zone edge (fills simulated on price trading through the level)
+- **Close:** SL/TP via mark **and** candle extremes (wick-safe)
+- **Stop-loss:** zone distance + 0.3% buffer beyond the level; **take-profit:** opposite zone level
+- **Pause:** only when no zone exists near price (trending with no structure)
+- **Persistence:** `ledger.json` (realized PnL + trade history, survives restarts), `state.json` (open position resumes after restart)
+- **Agent override:** `agent_zone.json` — write `{"support": S, "resistance": R}` to force a zone, or `{"side": "long", "entry": E, "sl": S, "tp": T}` for a fully-specified single trade; the bot polls the file every loop iteration
+- S/R detection: swing highs/lows from 5m candle highs/lows (24h window)
 
 ## Files
 

@@ -3,6 +3,10 @@ api_key_config.json
 .env
 *.log
 *.out
+# runtime state — trades, position resume, agent override
+ledger.json
+state.json
+agent_zone.json
 __pycache__/
 *.pyc
 .venv/

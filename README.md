@@ -52,21 +52,26 @@ Windows: use `python s_r_bot.py`. No other OS-specific steps — pure Python + a
 > scalper uses 15x leverage / 80% margin — a 0.7% adverse move ≈ 8% of margin
 > per trade. Trading perps can liquidate your position. Use at your own risk.
 
-## How the S/R scalper works (v3 spec)
+## How the S/R scalper works (v3.1 spec)
 
 - **15x leverage, 80% margin** per position, $100 paper portfolio
-- **Structure:** 5m candles from the Lighter candles API (24h lookback / 288 bars), swing pivots on candle highs/lows, pivot levels clustered and merged into zones
+- **Structure:** 5m candles from the Lighter candles API (24h lookback / 288 bars), swing pivots on candle highs/lows, pivot levels clustered and merged into zones (each zone tagged with support/resistance touch-volume ratios)
 - **Zone trading (3 modes):**
   - price inside a zone → resting buy at support **and** resting sell at resistance
   - price below a zone → "buy the dip" limit at the zone support (reclaim play)
   - price above a zone → "sell the rally" limit at the zone resistance
+- **Confluence filters (v3.1):** a side is armed only when ≥ 2 of 4 confirmations align:
+  1. EMA 9/21 — trend direction (price > EMA9 > EMA21 for longs)
+  2. Session VWAP (00:00 UTC anchor) — institutional bias (price > VWAP for longs)
+  3. RSI(7) — < 30 at support / > 70 at resistance (oversold/overbought at the level)
+  4. Volume spike — zone-edge touch volume ≥ 1.5× avg(50) = strong level
+  Settings per research: eplanetbrokers.com (RSI 5-7, 80/20; 70/30 = false alarms), sahi.com (VWAP direction; 2-3 indicators agreeing), mudrex.com (crypto session VWAP 00:00 UTC), quantvps.com/luxalgo.com (ATR stops 1.5-2×)
 - **Entry:** always LIMIT at the zone edge (fills simulated on price trading through the level)
 - **Close:** SL/TP via mark **and** candle extremes (wick-safe)
-- **Stop-loss:** zone distance + 0.3% buffer beyond the level; **take-profit:** opposite zone level
-- **Pause:** only when no zone exists near price (trending with no structure)
+- **Stop-loss:** max(zone distance + 0.3%, 1.5×ATR(14)) beyond the level; **take-profit:** opposite zone level
+- **Pause:** only when no zone exists near price OR no side reaches 2 confirmations
 - **Persistence:** `ledger.json` (realized PnL + trade history, survives restarts), `state.json` (open position resumes after restart)
-- **Agent override:** `agent_zone.json` — write `{"support": S, "resistance": R}` to force a zone, or `{"side": "long", "entry": E, "sl": S, "tp": T}` for a fully-specified single trade; the bot polls the file every loop iteration
-- S/R detection: swing highs/lows from 5m candle highs/lows (24h window)
+- **Agent override:** `agent_zone.json` — write `{"support": S, "resistance": R}` to force a zone, or `{"side": "long", "entry": E, "sl": S, "tp": T}` for a fully-specified single trade (bypasses confluence — explicit override); the bot polls the file every loop iteration
 
 ## Files
 

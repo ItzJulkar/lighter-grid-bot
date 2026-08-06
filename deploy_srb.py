@@ -10,6 +10,7 @@ REMOTE_DIR = "/home/ubuntu/lighter-grid"
 FILES = [
     ("s_r_bot.py", "s_r_bot.py"),
     ("restart_srb.sh", "restart_srb.sh"),
+    ("fix_cron.sh", "fix_cron.sh"),
     (".gitignore", ".gitignore"),
 ]
 

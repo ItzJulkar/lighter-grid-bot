@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-Lighter S/R Scalper — v3 (candle-based structure + zone trading + persistent ledger)
+Lighter S/R Scalper — v3.1 (candle-based structure + zone trading + confluence filters)
 
-v3 changes (from v2):
-  A. Candle-based S/R detection — 5m candles from the Lighter candles API
-     (24h lookback, 288 bars), swing pivots on candle highs/lows.
-     v2 sampled mark price every 2s and only saw ~6.7 minutes of history, so it
-     could never see the multi-hour boxes a human sees on the chart.
-  B. Zone trading — trades the actual support/resistance structure:
-       - price inside a zone  -> resting buy at support + resting sell at resistance
-       - price below a zone   -> "buy the dip" limit at the zone support (reclaim play)
-       - price above a zone   -> "sell the rally" limit at the zone resistance
-     v2 required a support below AND resistance above price (straddle), so it
-     PAUSED whenever price sat outside every detected box.
-  C. Persistent ledger (ledger.json) + state (state.json) — realized PnL and
-     trade history survive restarts; an open position resumes after restart.
-  D. agent_zone.json override — an external agent (e.g. Hermes cron) can write
-       {"support": S, "resistance": R}            -> force a zone (auto mode logic)
-       {"side":"long","entry":E,"sl":S,"tp":T}    -> fully-specified single trade
-     The bot polls the file every loop iteration.
+v3.1 adds CONFLUENCE FILTERS (user spec: "ekadhik indicator select koro, 2-3
+confirmation pailei trade execute"):
+  - EMA 9/21      : trend direction (long only when price > EMA9 > EMA21, short mirrored)
+  - VWAP (session): institutional bias, 00:00 UTC anchor (price > VWAP -> long bias)
+  - RSI(7)        : at support RSI < 30 = oversold confirmation; at resistance RSI > 70
+  - Volume spike  : zone-edge touch volume >= 1.5x avg(50) = strong level
+  - ATR(14)       : SL floor (stop at least 1.5x ATR from entry; never inside noise)
+  A side is ARMED only when >= CONFIRM_THRESHOLD (default 2) align.
+  agent_zone.json overrides bypass confluence (explicit human/agent levels).
+
+v3 base (unchanged):
+  A. 5m/24h candle S/R zones from the Lighter candles API
+  B. zone trading: inside -> buy@S + sell@R | below -> buy-dip@S | above -> sell-rally@R
+  C. persistent ledger.json + state.json (position resumes after restart)
 
 Paper mode default (simulated fills, $100 virtual). LIVE mode needs
 api_key_config.json + live order wiring (live_sync stub — NOT production ready).
@@ -43,6 +40,24 @@ MAX_ZONE_PCT = 4.0           # don't trade >4% ranges as mean-reversion zones
 RECLAIM_DIST_PCT = 1.5       # max price->zone-edge distance for reclaim/pullback setup
 PAPER_MARGIN_USD = 100.0
 LIVE_MODE = False
+
+# ---- confluence filters (v3.1, research-adjusted) ----
+# Sources: eplanetbrokers.com (RSI 5-7 / 80-20 or 75-25; 70/30 = false alarms),
+#          sahi.com (VWAP direction gate; max 2-3 indicators agreeing),
+#          mudrex.com (crypto session VWAP anchored 00:00 UTC),
+#          quantvps.com / luxalgo.com (ATR stops 1.5x-2x for day trading)
+CONFIRM_THRESHOLD = 2        # min aligned confirmations to arm a side (user: 2-3)
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 7
+RSI_CONF_LONG = 30           # RSI below this at support = oversold confirmation (ranges: buy at 30)
+RSI_CONF_SHORT = 70          # RSI above this at resistance = overbought confirmation (sell at 70)
+VWAP_SESSION_UTC = True      # session VWAP anchored at 00:00 UTC (crypto 24/7 standard)
+VWAP_MIN_BARS = 30           # fallback to rolling 288 if fewer session bars
+VOL_SPIKE_RATIO = 1.5        # zone-edge touch volume >= 1.5x avg(50) = strong level
+ATR_PERIOD = 14
+ATR_SL_FLOOR = 1.5           # SL at least 1.5 x ATR(14) from entry (day-trading range 1.5-2x)
+
 API_KEY_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_key_config.json")
 BASE_URL = "https://mainnet.zklighter.elliot.ai"
 LOG_FILE = "srb.log"
@@ -89,6 +104,54 @@ class Position:
         if not d: return None
         return Position(d["side"], d["size"], d["entry"], d["sl"], d["tp"], d["margin"], d.get("opened_at"))
 
+# ---------------- indicator math ----------------
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+def rsi(closes, period):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0)); losses.append(max(-d, 0.0))
+    g = sum(gains[-period:]) / period
+    l = sum(losses[-period:]) / period
+    if l == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1 + g / l)
+
+def vwap(candles):
+    """Session VWAP anchored at 00:00 UTC (crypto 24/7 standard, per mudrex.com).
+    Falls back to a rolling 288-bar VWAP if fewer than VWAP_MIN_BARS since midnight."""
+    if not candles:
+        return None
+    now_t = candles[-1]["t"]
+    day_start = int(now_t // 86400) * 86400
+    seg = [c for c in candles if c["t"] >= day_start and c["v"] > 0]
+    if len(seg) < VWAP_MIN_BARS:
+        seg = [c for c in candles[-CANDLE_BARS:] if c["v"] > 0]
+    if not seg:
+        return None
+    pv = sum(((c["h"] + c["l"] + c["c"]) / 3) * c["v"] for c in seg)
+    vol = sum(c["v"] for c in seg)
+    return pv / vol if vol > 0 else None
+
+def atr(candles, period):
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / period
+
 # ---------------- market data ----------------
 _session = requests.Session()
 RES_MS = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
@@ -105,7 +168,7 @@ def fetch_mark():
     return None
 
 def fetch_candles(res, count_back):
-    """Return list of dicts {t(sec),o,h,l,c} or None. Zero-value candles are omitted by the API."""
+    """List of dicts {t(sec),o,h,l,c,v} or None. Zero-value candles are omitted by the API."""
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - res_ms(res) * count_back
     try:
@@ -120,13 +183,15 @@ def fetch_candles(res, count_back):
     if d.get("code") != 200:
         log(f"candles API error: {d}")
         return None
-    return [{"t": c["t"] // 1000, "o": c["o"], "h": c["h"], "l": c["l"], "c": c["c"]} for c in d.get("c", [])]
+    return [{"t": c["t"] // 1000, "o": c["o"], "h": c["h"], "l": c["l"], "c": c["c"], "v": c.get("v", 0.0)}
+            for c in d.get("c", [])]
 
 # ---------------- structure detection ----------------
 class Structure:
     def __init__(self):
-        self.candles = []       # list of {t,o,h,l,c} (t in seconds), last = forming candle
-        self.zones = []         # list of (support, resistance) merged boxes
+        self.candles = []       # list of {t,o,h,l,c,v} (t in seconds), last = forming candle
+        self.zones = []         # list of dicts {s, r, vs, vr} merged boxes + volume ratios
+        self.signals = {}       # confluence signals computed on refresh
         self.last_zone_sig = None
 
     def seed(self, candles):
@@ -138,12 +203,12 @@ class Structure:
             c = self.candles[-1]
             c["h"] = max(c["h"], mark); c["l"] = min(c["l"], mark); c["c"] = mark
         else:
-            self.candles.append({"t": now, "o": mark, "h": mark, "l": mark, "c": mark})
+            self.candles.append({"t": now, "o": mark, "h": mark, "l": mark, "c": mark, "v": 0.0})
             if len(self.candles) > CANDLE_BARS + 1:
                 self.candles = self.candles[-(CANDLE_BARS + 1):]
 
     def refresh(self):
-        """Re-fetch closed candles from the API and recompute structure."""
+        """Re-fetch closed candles from the API and recompute structure + signals."""
         d = fetch_candles(CANDLE_RES, CANDLE_BARS)
         if not d:
             return False
@@ -151,6 +216,7 @@ class Structure:
             d[-1] = self.candles[-1]    # keep the fresher locally-built forming candle
         self.candles = d
         self._recompute()
+        self._compute_signals()
         return True
 
     def _pivot_levels(self):
@@ -164,28 +230,46 @@ class Structure:
         for i in range(lb, n - lb):
             h = closed[i]["h"]; l = closed[i]["l"]
             if h == max(c["h"] for c in closed[i - lb:i + lb + 1]):
-                highs.append(h)
+                highs.append((h, closed[i]["v"]))
             if l == min(c["l"] for c in closed[i - lb:i + lb + 1]):
-                lows.append(l)
+                lows.append((l, closed[i]["v"]))
         def cluster(levels):
             if not levels:
                 return []
             out = []
-            for lv in sorted(levels):
-                if out and abs(lv - out[-1]) / out[-1] * 100 <= MERGE_PCT:
-                    out[-1] = (out[-1] + lv) / 2
+            for lv, vv in sorted(levels):
+                if out and abs(lv - out[-1][0]) / out[-1][0] * 100 <= MERGE_PCT:
+                    out[-1] = ((out[-1][0] + lv) / 2, max(out[-1][1], vv))
                 else:
-                    out.append(lv)
+                    out.append((lv, vv))
             return out
         return cluster(highs), cluster(lows)
+
+    def _touch_vol_ratio(self, level, side):
+        """Max volume of candles rejecting AT the level / avg volume(50). 0 if none."""
+        closed = self.candles[:-1]
+        if len(closed) < 51:
+            return 0.0
+        avg = sum(c["v"] for c in closed[-50:]) / 50
+        if avg <= 0:
+            return 0.0
+        if side == "s":
+            touches = [c for c in closed[-CANDLE_BARS:]
+                       if c["l"] <= level and c["l"] >= level * (1 - 0.003)]
+        else:
+            touches = [c for c in closed[-CANDLE_BARS:]
+                       if c["h"] >= level and c["h"] <= level * (1 + 0.003)]
+        if not touches:
+            return 0.0
+        return max(c["v"] for c in touches) / avg
 
     def _recompute(self):
         res, sup = self._pivot_levels()
         zones = []
-        for r in res:
-            cands = [s for s in sup if s < r and (r - s) / s * 100 <= MAX_ZONE_PCT]
+        for r, _rv in res:
+            cands = [(s, sv) for s, sv in sup if s < r and (r - s) / s * 100 <= MAX_ZONE_PCT]
             if cands:
-                s = max(cands)
+                s, _sv = max(cands, key=lambda x: x[0])
                 if (r - s) / s * 100 >= MIN_SR_DIST_PCT:
                     zones.append([s, r])
         zones.sort(key=lambda z: z[0])
@@ -195,29 +279,61 @@ class Structure:
                 merged[-1][1] = max(merged[-1][1], z[1])
             else:
                 merged.append(list(z))
-        self.zones = [[round(s, 2), round(r, 2)] for s, r in merged]
-        sig = tuple(tuple(z) for z in self.zones)
+        self.zones = [{"s": round(s, 2), "r": round(r, 2),
+                       "vs": round(self._touch_vol_ratio(s, "s"), 2),
+                       "vr": round(self._touch_vol_ratio(r, "r"), 2)}
+                      for s, r in merged]
+        sig = tuple((z["s"], z["r"]) for z in self.zones)
         if sig != self.last_zone_sig:
             self.last_zone_sig = sig
-            log(f"STRUCTURE: {len(self.zones)} zone(s) — {self.zones if self.zones else 'none'}")
+            log(f"STRUCTURE: {len(self.zones)} zone(s) — "
+                f"{[{'z': [z['s'], z['r']], 'vol': [z['vs'], z['vr']]} for z in self.zones] if self.zones else 'none'}")
+
+    def _compute_signals(self):
+        closed = self.candles[:-1]
+        s = {"ema_bull": False, "ema_bear": False,
+             "vwap_bull": False, "vwap_bear": False,
+             "rsi": None, "atr_pct": None}
+        if not closed:
+            self.signals = s
+            return
+        closes = [c["c"] for c in closed]
+        price = closes[-1]
+        e9 = ema(closes, EMA_FAST); e21 = ema(closes, EMA_SLOW)
+        if e9 is not None and e21 is not None:
+            s["ema_bull"] = price > e9 > e21
+            s["ema_bear"] = price < e9 < e21
+        vw = vwap(closed)
+        if vw is not None:
+            s["vwap_bull"] = price > vw
+            s["vwap_bear"] = price < vw
+        s["rsi"] = rsi(closes, RSI_PERIOD)
+        a = atr(closed, ATR_PERIOD)
+        if a is not None:
+            s["atr_pct"] = a / price * 100.0
+        self.signals = s
+        log(f"SIGNALS: ema={'BULL' if s['ema_bull'] else 'BEAR' if s['ema_bear'] else '-'} "
+            f"vwap={'BULL' if s['vwap_bull'] else 'BEAR' if s['vwap_bear'] else '-'} "
+            f"rsi={s['rsi'] if s['rsi'] is not None else '-'} "
+            f"atr%={s['atr_pct'] if s['atr_pct'] is not None else '-'}")
 
     def select_zone(self, mark):
-        """Return (mode, s, r): mode in {'inside','buy','sell'} or (None,None,None)."""
-        inside = [z for z in self.zones if z[0] <= mark <= z[1]]
+        """Return (mode, zone_dict) with mode in {'inside','buy','sell'} or (None, None)."""
+        inside = [z for z in self.zones if z["s"] <= mark <= z["r"]]
         if inside:
-            z = min(inside, key=lambda z: z[1] - z[0])
-            return "inside", z[0], z[1]
-        above = [z for z in self.zones if z[0] > mark]
+            z = min(inside, key=lambda z: z["r"] - z["s"])
+            return "inside", z
+        above = [z for z in self.zones if z["s"] > mark]
         if above:
-            z = min(above, key=lambda z: z[0])
-            if (z[0] - mark) / mark * 100 <= RECLAIM_DIST_PCT:
-                return "buy", z[0], z[1]
-        below = [z for z in self.zones if z[1] < mark]
+            z = min(above, key=lambda z: z["s"])
+            if (z["s"] - mark) / mark * 100 <= RECLAIM_DIST_PCT:
+                return "buy", z
+        below = [z for z in self.zones if z["r"] < mark]
         if below:
-            z = max(below, key=lambda z: z[1])
-            if (mark - z[1]) / mark * 100 <= RECLAIM_DIST_PCT:
-                return "sell", z[0], z[1]
-        return None, None, None
+            z = max(below, key=lambda z: z["r"])
+            if (mark - z["r"]) / mark * 100 <= RECLAIM_DIST_PCT:
+                return "sell", z
+        return None, None
 
 # ---------------- bot ----------------
 class SRBot:
@@ -226,8 +342,7 @@ class SRBot:
         self.live = live
         self.struct = Structure()
         self.pos = None
-        self.resting = []        # list of dicts: {side, price, size, place_mark, mark_min, mark_max}
-        self.setup = None        # (mode, s, r) currently armed, or ("agent", side, price, sl, tp)
+        self.resting = []        # list of dicts: {side, price, size, sl, tp, place_mark, mark_min, mark_max}
         self.closed_count = 0
         self.realized = 0.0
         self.order_seq = 5000
@@ -235,7 +350,7 @@ class SRBot:
         self.account_api = None
         self.last_refresh = 0.0
         self.last_state_save = 0.0
-        self.agent_file = None   # parsed agent_zone.json content
+        self.agent_file = None
         self._load_ledger()
         self._load_state()
 
@@ -341,7 +456,6 @@ class SRBot:
             pass
 
     def _agent_setup(self, mark):
-        """If agent file gives a full trade spec, return its (side, price, sl, tp)."""
         d = self.agent_file or {}
         if all(k in d for k in ("side", "entry", "sl", "tp")):
             side = str(d["side"]).lower()
@@ -354,12 +468,32 @@ class SRBot:
         if "support" in d and "resistance" in d:
             s, r = float(d["support"]), float(d["resistance"])
             if 0 < s < r:
-                if s <= mark <= r:
-                    return "inside", s, r
-                if mark < s:
-                    return "buy", s, r
-                return "sell", s, r
+                return {"s": s, "r": r, "vs": 0.0, "vr": 0.0}
         return None
+
+    # ---- confluence ----
+    def _side_conf(self, side, zone, mark):
+        """Confirmations for one side. Returns (count, [names])."""
+        sig = self.struct.signals
+        confs = []
+        if side == "long":
+            if sig.get("ema_bull"): confs.append("ema")
+            if sig.get("vwap_bull"): confs.append("vwap")
+            if sig.get("rsi") is not None and sig["rsi"] < RSI_CONF_LONG: confs.append("rsi")
+            if zone.get("vs", 0) >= VOL_SPIKE_RATIO: confs.append("vol")
+        else:
+            if sig.get("ema_bear"): confs.append("ema")
+            if sig.get("vwap_bear"): confs.append("vwap")
+            if sig.get("rsi") is not None and sig["rsi"] > RSI_CONF_SHORT: confs.append("rsi")
+            if zone.get("vr", 0) >= VOL_SPIKE_RATIO: confs.append("vol")
+        return len(confs), confs
+
+    def _sl_dist_pct(self, sr_dist):
+        atr_pct = self.struct.signals.get("atr_pct")
+        base = sr_dist + SL_BUFFER_PCT
+        if atr_pct is None:
+            return base
+        return max(base, ATR_SL_FLOOR * atr_pct)
 
     # ---- core ----
     def step(self, mark, now):
@@ -388,63 +522,64 @@ class SRBot:
             self.last_state_save = now
 
     def _manage_entries(self, mark, now):
-        """Arm/cancel resting limit orders from the operative zone (auto or agent)."""
-        # decide desired setup
+        """Arm/cancel resting orders. Auto mode: per-side confluence (>= threshold).
+        Agent mode: explicit override, no confluence.
+        Logging is change-gated: decisions print only when the armed set changes."""
         agent_trade = self._agent_setup(mark)
         if agent_trade:
             side, price, sl, tp = agent_trade
-            desired = ("agent", side, price, sl, tp)
+            desired = [(side, round(price, 2), round(sl, 2), round(tp, 2))]
+            notes = [f"AGENT LIMIT {side.upper()} @ {price:.2f} sl={sl:.2f} tp={tp:.2f}"]
         else:
             az = self._agent_zone(mark)
-            mode, s, r = az if az else self.struct.select_zone(mark)
-            if mode is None:
-                desired = None
-            elif mode == "inside":
-                desired = ("inside", s, r)
-            elif mode == "buy":
-                desired = ("buy", s, r)
+            if az:
+                mode = "inside" if az["s"] <= mark <= az["r"] else ("buy" if mark < az["s"] else "sell")
+                zone = az
             else:
-                desired = ("sell", s, r)
+                mode, zone = self.struct.select_zone(mark)
+            desired, notes = [], []
+            if zone is not None:
+                sr_dist = (zone["r"] - zone["s"]) / zone["s"] * 100.0
+                sl_dist = self._sl_dist_pct(sr_dist)
+                if mode in ("inside", "buy"):
+                    n, names = self._side_conf("long", zone, mark)
+                    if n >= CONFIRM_THRESHOLD:
+                        sl = zone["s"] * (1 - sl_dist / 100.0)
+                        desired.append(("long", round(zone["s"], 2), round(sl, 2), round(zone["r"], 2)))
+                        notes.append(f"ARM LONG @ {zone['s']:.2f} (conf {n}/{CONFIRM_THRESHOLD}: {','.join(names)})")
+                    else:
+                        notes.append(f"skip LONG @ {zone['s']:.2f} (conf {n}/{CONFIRM_THRESHOLD}: {','.join(names) or 'none'})")
+                if mode in ("inside", "sell"):
+                    n, names = self._side_conf("short", zone, mark)
+                    if n >= CONFIRM_THRESHOLD:
+                        sl = zone["r"] * (1 + sl_dist / 100.0)
+                        desired.append(("short", round(zone["r"], 2), round(sl, 2), round(zone["s"], 2)))
+                        notes.append(f"ARM SHORT @ {zone['r']:.2f} (conf {n}/{CONFIRM_THRESHOLD}: {','.join(names)})")
+                    else:
+                        notes.append(f"skip SHORT @ {zone['r']:.2f} (conf {n}/{CONFIRM_THRESHOLD}: {','.join(names) or 'none'})")
+            elif mode is None:
+                notes.append("PAUSE: no valid S/R zone")
 
-        if desired != self.setup:
-            old = self.setup
+        current = sorted((o["side"], round(o["price"], 2), round(o["sl"], 2), round(o["tp"], 2))
+                         for o in self.resting)
+        want = sorted(desired)
+        if want != current:
             self.resting = []
-            self.setup = desired
-            if desired is None:
-                log("PAUSE: no valid S/R zone — cancelling resting orders")
-            else:
-                log(f"SETUP: {desired} (was {old})")
-            if desired is not None:
-                self._arm(desired, mark)
-
+            if notes:
+                for note in notes:
+                    log("  " + note)
+            if want:
+                self._arm(want, mark)
         if self.resting:
             self._check_fills(mark, now)
 
-    def _arm(self, setup, mark):
+    def _arm(self, specs, mark):
         sz = self.size_for(mark)
-        if setup[0] == "agent":
-            _, side, price, sl, tp = setup
+        for side, price, sl, tp in specs:
             self.resting.append({"side": side, "price": price, "size": sz,
                                  "sl": sl, "tp": tp, "place_mark": mark,
                                  "mark_min": mark, "mark_max": mark})
-            log(f"  AGENT LIMIT {side.upper()} @ {price:.2f} size={sz:.4f} sl={sl:.2f} tp={tp:.2f}")
-            return
-        mode, s, r = setup
-        sr_dist = (r - s) / s * 100.0
-        if mode in ("inside", "buy"):
-            sl = s * (1 - (sr_dist + SL_BUFFER_PCT) / 100.0)
-            tp = r
-            self.resting.append({"side": "long", "price": s, "size": sz,
-                                 "sl": sl, "tp": tp, "place_mark": mark,
-                                 "mark_min": mark, "mark_max": mark})
-            log(f"  LIMIT BUY @ {s:.2f} size={sz:.4f} sl={sl:.2f} tp={tp:.2f} (zone {s:.2f}-{r:.2f})")
-        if mode in ("inside", "sell"):
-            sl = r * (1 + (sr_dist + SL_BUFFER_PCT) / 100.0)
-            tp = s
-            self.resting.append({"side": "short", "price": r, "size": sz,
-                                 "sl": sl, "tp": tp, "place_mark": mark,
-                                 "mark_min": mark, "mark_max": mark})
-            log(f"  LIMIT SELL @ {r:.2f} size={sz:.4f} sl={sl:.2f} tp={tp:.2f} (zone {s:.2f}-{r:.2f})")
+            log(f"  LIMIT {side.upper()} @ {price:.2f} size={sz:.4f} sl={sl:.2f} tp={tp:.2f}")
 
     def _check_fills(self, mark, now):
         for o in self.resting:
@@ -460,7 +595,6 @@ class SRBot:
     def _open(self, side, price, sz, sl, tp):
         self.pos = Position(side, sz, price, sl, tp, self.margin * MARGIN_USE)
         self.resting = []
-        self.setup = None
         log(f"  OPEN {side.upper()} @ {price:.2f} size={sz:.4f} sl={sl:.2f} tp={tp:.2f}")
 
     def _manage_position(self, mark, candle_low, candle_high):
@@ -496,8 +630,9 @@ class SRBot:
 
 # ---------------- main ----------------
 async def main():
-    log(f"S/R Scalper v3 — {MARKET_SYMBOL} lev={LEVERAGE}x margin_use={MARGIN_USE*100:.0f}% "
-        f"sl_buffer={SL_BUFFER_PCT}% candles={CANDLE_RES}/{CANDLE_BARS} paper_margin=${PAPER_MARGIN_USD:.0f} live={LIVE_MODE}")
+    log(f"S/R Scalper v3.1 — {MARKET_SYMBOL} lev={LEVERAGE}x margin_use={MARGIN_USE*100:.0f}% "
+        f"confluence={CONFIRM_THRESHOLD}/{EMA_FAST}-{EMA_SLOW}EMA/VWAP-sess/RSI{RSI_PERIOD}/vol{VOL_SPIKE_RATIO}/ATR{ATR_SL_FLOOR} "
+        f"candles={CANDLE_RES}/{CANDLE_BARS} paper_margin=${PAPER_MARGIN_USD:.0f} live={LIVE_MODE}")
     bot = SRBot(PAPER_MARGIN_USD, live=LIVE_MODE)
     if LIVE_MODE:
         await bot.live_init()

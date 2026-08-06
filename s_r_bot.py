@@ -123,6 +123,8 @@ def rsi(closes, period):
         gains.append(max(d, 0.0)); losses.append(max(-d, 0.0))
     g = sum(gains[-period:]) / period
     l = sum(losses[-period:]) / period
+    if g == 0 and l == 0:
+        return 50.0            # flat market -> neutral RSI
     if l == 0:
         return 100.0
     return 100.0 - 100.0 / (1 + g / l)
